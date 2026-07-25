@@ -124,7 +124,20 @@ print(response.choices[0].message.content)
 print(response.usage)  # prompt_tokens / completion_tokens / total_tokens
 ```
 
-The `blockrun/` prefix is stripped before being sent to the BlockRun gateway, so `openai/gpt-5.5`, `anthropic/claude-fable-5`, `google/gemini-3.1-pro`, etc. all work — anything in BlockRun's catalog.
+The `blockrun/` prefix is stripped before being sent to the BlockRun gateway, so `openai/gpt-5.6-terra`, `anthropic/claude-opus-5`, `google/gemini-3.1-pro`, etc. all work — anything in BlockRun's catalog.
+
+For local allowlists and model pickers, the package includes the current 82-model
+catalog snapshot (chat, image, video, music, speech, and sound effects):
+
+```python
+from blockrun_litellm import model_ids, is_known_model
+
+assert "anthropic/claude-opus-5" in model_ids()
+assert is_known_model("blockrun/anthropic/claude-opus-5")
+```
+
+The gateway is authoritative and accepts newly released IDs before a package
+update; query `https://blockrun.ai/api/v1/models` whenever you need live metadata.
 
 ### 1c. Override the wallet per-call (optional)
 

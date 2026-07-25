@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.9.0 — 2026-07-24
+
+### Added
+
+- **Bundled model-catalog snapshot** (`blockrun_litellm.catalog`). `BLOCKRUN_MODEL_IDS`
+  carries the gateway's 82 published IDs — chat, image, video, music, speech, and
+  sound effects — in the gateway's own catalog order, with `model_ids()` and
+  `is_known_model()` exported from the package. `is_known_model()` accepts both the
+  custom-provider `blockrun/<id>` form and the bare gateway `<id>` form.
+
+  This exists for callers that must render an allowlist or a model picker
+  *before* a proxy is running. It is not an admission control list: the gateway
+  is the source of truth and accepts newly released IDs before this package is
+  republished, so nothing here blocks a forward.
+
+- `CATALOG_SNAPSHOT_DATE` records when the snapshot was taken, so a consumer can
+  tell how stale its bundled copy is rather than guessing from the package version.
+  Verified against `GET https://blockrun.ai/api/v1/models` on 2026-07-24: 82 live
+  IDs, exact match including order.
+
+### Changed
+
+- `examples/litellm_config.yaml` gains `claude-opus-5` ($5 / $25 per 1M, with
+  prompt-cache read/write rates) and moves the flagship OpenAI example to
+  `gpt-5.6-terra` ($2.50 / $15 per 1M). Both price pairs match the gateway's
+  published pricing; the cache ratios follow the existing Anthropic entries
+  (0.1× input for reads, 1.25× for writes).
+
+### Compatibility
+
+- Purely additive. No runtime behavior, wire format, or payment path changes —
+  the catalog module is a dependency-free constant and two pure functions.
+
 ## 0.8.0 — 2026-07-22
 
 ### Added
