@@ -42,7 +42,7 @@ from litellm import CustomLLM
 from litellm.types.utils import GenericStreamingChunk
 
 from blockrun_llm.types import APIError as BlockRunAPIError
-from blockrun_llm.types import ChatCompletionChunk
+from blockrun_llm.types import ChatCompletionChunk, ChatUsage
 
 from blockrun_litellm import _adapter
 
@@ -249,10 +249,51 @@ def _native_extras(chunk: ChatCompletionChunk) -> Dict[str, Any]:
     # leaking a stray ``cost_usd`` field into ``provider_specific_fields``.
     extras.pop("cost_usd", None)
     if chunk.usage is not None:
-        usage_extra = chunk.usage.model_extra or {}
-        if usage_extra:
-            extras.setdefault("usage_details", {}).update(usage_extra)
+        # NB: ``prompt_tokens_details`` / ``completion_tokens_details`` are NOT
+        # declared fields on ChatUsage — they are pydantic extras (``extra =
+        # "allow"``), so they already live in ``model_extra`` and are picked up
+        # by the dict() copy below. Never read them by attribute: access to an
+        # absent pydantic extra raises AttributeError, it does not return None.
+        usage_details: Dict[str, Any] = dict(chunk.usage.model_extra or {})
+        if chunk.usage.cache_read_input_tokens is not None:
+            usage_details["cache_read_input_tokens"] = chunk.usage.cache_read_input_tokens
+        if chunk.usage.cache_creation_input_tokens is not None:
+            usage_details["cache_creation_input_tokens"] = chunk.usage.cache_creation_input_tokens
+        if usage_details:
+            extras.setdefault("usage_details", {}).update(usage_details)
     return extras
+
+
+def _usage_dict(usage: ChatUsage) -> Dict[str, Any]:
+    """Map a :class:`ChatUsage` → the plain usage dict LiteLLM's streaming
+    handler feeds into ``litellm.Usage``.
+
+    Carries the token-detail passthrough: ``prompt_tokens_details`` /
+    ``completion_tokens_details`` (pydantic extras — read from ``model_extra``,
+    see :func:`_native_extras`) and the Anthropic cache split. The gateway
+    folds cache reads INTO ``prompt_tokens`` (matching LiteLLM's own
+    convention), so forwarding ``cache_read_input_tokens`` lets LiteLLM apply
+    the cache-read discount instead of billing the full prompt rate.
+
+    Used by BOTH ``_to_generic_chunk`` branches: the choice-less
+    ``include_usage`` final frame AND a choices-bearing chunk that carries
+    usage inline. Keeping one builder means the two paths can never disagree
+    about which detail fields survive.
+    """
+    out: Dict[str, Any] = {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
+    extra = usage.model_extra or {}
+    for key in ("prompt_tokens_details", "completion_tokens_details"):
+        if extra.get(key) is not None:
+            out[key] = extra[key]
+    if usage.cache_read_input_tokens is not None:
+        out["cache_read_input_tokens"] = usage.cache_read_input_tokens
+    if usage.cache_creation_input_tokens is not None:
+        out["cache_creation_input_tokens"] = usage.cache_creation_input_tokens
+    return out
 
 
 def _to_generic_chunk(chunk: ChatCompletionChunk) -> GenericStreamingChunk:
@@ -275,13 +316,7 @@ def _to_generic_chunk(chunk: ChatCompletionChunk) -> GenericStreamingChunk:
         # off them instead of re-estimating the prompt with its own tokenizer
         # (tiktoken drifts ~37% vs the gateway's real upstream count). Older
         # gateways that never send this frame still hit the usage=None path.
-        usage = None
-        if chunk.usage is not None:
-            usage = {
-                "prompt_tokens": chunk.usage.prompt_tokens,
-                "completion_tokens": chunk.usage.completion_tokens,
-                "total_tokens": chunk.usage.total_tokens,
-            }
+        usage = _usage_dict(chunk.usage) if chunk.usage is not None else None
         # NOTE: deliberately do NOT set tool_use here. This is the post-finish
         # usage frame; adding the key changes LiteLLM's CustomStreamWrapper
         # post-finish guard and lets the frame survive even without
@@ -318,13 +353,14 @@ def _to_generic_chunk(chunk: ChatCompletionChunk) -> GenericStreamingChunk:
     # Anthropic adapter — see _iter_stream_chunks(), which wraps this function.
 
     # BlockRun's per-chunk usage is rarely populated; LiteLLM tolerates None.
-    usage = None
-    if chunk.usage is not None:
-        usage = {
-            "prompt_tokens": chunk.usage.prompt_tokens,
-            "completion_tokens": chunk.usage.completion_tokens,
-            "total_tokens": chunk.usage.total_tokens,
-        }
+    # When a provider DOES attach usage to a choices-bearing chunk (instead of
+    # a separate include_usage frame), it must carry the same detail fields as
+    # the choice-less branch — a bare three-count dict here would contradict
+    # the full detail riding on provider_specific_fields, and LiteLLM's chunk
+    # builder resets prompt_tokens_details unconditionally from the LAST
+    # usage-bearing chunk (streaming_chunk_builder_utils), so an asymmetric
+    # frame can null out detail a previous frame delivered.
+    usage = _usage_dict(chunk.usage) if chunk.usage is not None else None
 
     return GenericStreamingChunk(
         text=text,

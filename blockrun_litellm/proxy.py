@@ -1735,6 +1735,57 @@ def _responses_to_chat(
     return model, messages, openai_kwargs, bool(body.get("stream"))
 
 
+def _int_or_zero(value: Any) -> int:
+    """Coerce an upstream token count to a non-negative int (0 on garbage).
+
+    The detail blocks arrive as untyped pydantic extras — whatever JSON the
+    upstream sent. This is the guard between that and our typed public
+    Responses surface (LiteLLM has the same guard in ``Usage.__init__``).
+    """
+    if isinstance(value, bool):  # bool is an int subclass; reject explicitly
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float) and value == int(value):
+        return max(int(value), 0)
+    return 0
+
+
+def _usage_to_responses(usage: Dict[str, Any]) -> Dict[str, Any]:
+    """chat.completion ``usage`` dict → Responses API ``usage`` object.
+
+    Spec-correct per ``openai.types.responses.ResponseUsage``: BOTH
+    ``input_tokens_details`` and ``output_tokens_details`` are REQUIRED, as are
+    ``cached_tokens`` / ``reasoning_tokens`` inside them — so they are always
+    emitted, defaulting to 0, never conditionally omitted. Only the spec keys
+    are projected: splatting the chat-shaped dicts verbatim would leak
+    ``audio_tokens`` / ``accepted_prediction_tokens`` etc. into a surface that
+    doesn't define them, and would pass through non-dict garbage unchecked.
+
+    Anthropic models carry cache reads ONLY in the top-level
+    ``cache_read_input_tokens`` (no ``prompt_tokens_details``), so that field
+    is the fallback for ``cached_tokens``. Safe to equate: the gateway folds
+    cache reads into ``prompt_tokens``, matching what OpenAI's own
+    ``cached_tokens`` is a subset of.
+    """
+    ptd = usage.get("prompt_tokens_details")
+    ctd = usage.get("completion_tokens_details")
+    ptd = ptd if isinstance(ptd, dict) else {}
+    ctd = ctd if isinstance(ctd, dict) else {}
+    cached = _int_or_zero(ptd.get("cached_tokens"))
+    if cached == 0:
+        cached = _int_or_zero(usage.get("cache_read_input_tokens"))
+    return {
+        "input_tokens": _int_or_zero(usage.get("prompt_tokens")),
+        "output_tokens": _int_or_zero(usage.get("completion_tokens")),
+        "total_tokens": _int_or_zero(usage.get("total_tokens")),
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens_details": {
+            "reasoning_tokens": _int_or_zero(ctd.get("reasoning_tokens"))
+        },
+    }
+
+
 def _chat_payload_to_response(payload: Dict[str, Any], model: str) -> Dict[str, Any]:
     """chat.completion dict → Responses API ``response`` object (non-streaming)."""
     choice = (payload.get("choices") or [{}])[0]
@@ -1758,11 +1809,7 @@ def _chat_payload_to_response(payload: Dict[str, Any], model: str) -> Dict[str, 
             }
         ],
         "output_text": text,
-        "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
-            "output_tokens": usage.get("completion_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-        },
+        "usage": _usage_to_responses(usage),
     }
 
 
@@ -1824,7 +1871,7 @@ async def _responses_sse_stream(
     seq += 1
 
     parts: List[str] = []
-    usage_out = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    usage_out: Dict[str, Any] = _usage_to_responses({})
 
     async with _get_semaphore():
         try:
@@ -1849,11 +1896,19 @@ async def _responses_sse_stream(
                     seq += 1
                 u = cd.get("usage")
                 if u:
-                    usage_out = {
-                        "input_tokens": u.get("prompt_tokens", 0),
-                        "output_tokens": u.get("completion_tokens", 0),
-                        "total_tokens": u.get("total_tokens", 0),
-                    }
+                    # MERGE, don't replace: the gateway emits one canonical
+                    # include_usage final frame, but if a provider ever sends a
+                    # later bare usage frame (three counts, no details), a
+                    # wholesale reassignment would wipe detail captured
+                    # earlier. Scalar counts take the latest value; the two
+                    # detail blocks only advance, never regress to zero.
+                    fresh = _usage_to_responses(u)
+                    for block in ("input_tokens_details", "output_tokens_details"):
+                        prev = usage_out.get(block) or {}
+                        if any(fresh[block].values()) or not any(prev.values()):
+                            continue
+                        fresh[block] = prev
+                    usage_out = fresh
         except PaymentError as exc:
             yield _responses_event(
                 seq,

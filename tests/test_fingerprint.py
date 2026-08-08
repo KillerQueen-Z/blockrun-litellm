@@ -64,6 +64,7 @@ def _fingerprinted_response() -> ChatResponse:
             cache_read_input_tokens=4,
             # OpenAI-native nested breakdown (extra → must survive)
             prompt_tokens_details={"cached_tokens": 4},
+            completion_tokens_details={"reasoning_tokens": 3},
         ),
     )
 
@@ -113,6 +114,7 @@ def test_build_response_preserves_usage_cache_details() -> None:
     usage = dumped["usage"]
     assert usage["cache_read_input_tokens"] == 4
     assert usage["prompt_tokens_details"]["cached_tokens"] == 4
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == 3
 
 
 def test_build_response_preserves_reasoning_content() -> None:
@@ -173,4 +175,5 @@ def test_proxy_dump_preserves_fingerprint() -> None:
     assert dumped["service_tier"] == "default"
     assert dumped["usage"]["cache_read_input_tokens"] == 4
     assert dumped["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+    assert dumped["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
     assert dumped["choices"][0]["message"]["reasoning_content"] == "because reasons"

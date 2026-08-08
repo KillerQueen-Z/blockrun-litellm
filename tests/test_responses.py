@@ -76,7 +76,15 @@ def test_responses_non_streaming_shape() -> None:
     assert j["output"][0]["type"] == "message"
     assert j["output"][0]["content"][0] == {"type": "output_text", "text": "我是助手", "annotations": []}
     assert j["output_text"] == "我是助手"
-    assert j["usage"] == {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+    # input/output_tokens_details are REQUIRED by the Responses spec
+    # (openai.types.responses.ResponseUsage) — always present, zero-defaulted.
+    assert j["usage"] == {
+        "input_tokens": 5,
+        "output_tokens": 3,
+        "total_tokens": 8,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    }
     assert j["id"].startswith("resp_")
 
 

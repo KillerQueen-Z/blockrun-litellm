@@ -40,7 +40,13 @@ from blockrun_llm.types import (
 from blockrun_litellm.provider import _to_generic_chunk, register
 
 
-GATEWAY_USAGE = ChatUsage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+GATEWAY_USAGE = ChatUsage(
+    prompt_tokens=100,
+    completion_tokens=20,
+    total_tokens=120,
+    cache_read_input_tokens=40,
+    completion_tokens_details={"reasoning_tokens": 12},
+)
 
 
 def _chunk(
@@ -71,6 +77,8 @@ def test_usage_frame_forwards_token_counts() -> None:
         "prompt_tokens": 100,
         "completion_tokens": 20,
         "total_tokens": 120,
+        "completion_tokens_details": {"reasoning_tokens": 12},
+        "cache_read_input_tokens": 40,
     }
     # The frame must not terminate or mutate the stream state.
     assert gchunk["text"] == ""
@@ -151,6 +159,9 @@ def test_usage_survives_custom_stream_wrapper() -> None:
     assert built.usage.prompt_tokens == 100
     assert built.usage.completion_tokens == 20
     assert built.usage.total_tokens == 120
+    dumped_usage = built.usage.model_dump()
+    assert dumped_usage["completion_tokens_details"]["reasoning_tokens"] == 12
+    assert dumped_usage["cache_read_input_tokens"] == 40
 
 
 def test_usage_dropped_without_provider_specific_fields_key() -> None:
@@ -224,3 +235,56 @@ def test_usage_dropped_without_provider_specific_fields_key() -> None:
         "_to_generic_chunk may no longer need to emit the key. Re-check "
         "streaming_handler.py before relaxing the contract."
     )
+
+
+# ---------------------------------------------------------------------------
+# Detail-field passthrough: both usage branches, and the absent-details case.
+# ---------------------------------------------------------------------------
+
+def test_usage_frame_without_details_does_not_crash() -> None:
+    """Regression: prompt_tokens_details / completion_tokens_details are
+    pydantic EXTRAS on ChatUsage (extra="allow"), not declared fields.
+    Attribute access on an absent extra raises AttributeError — it does not
+    return None. A gateway usage frame carrying only the three counts (or only
+    the Anthropic cache fields) must convert cleanly; before the model_extra
+    fix this raised, LiteLLM wrapped it into APIConnectionError, and clients
+    retried an already-settled stream."""
+    bare = ChatUsage(prompt_tokens=100, completion_tokens=20, total_tokens=120)
+    gchunk = _to_generic_chunk(_chunk([], usage=bare))
+    assert gchunk["usage"] == {
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+    }
+
+    anthropic_shape = ChatUsage(
+        prompt_tokens=2160,
+        completion_tokens=20,
+        total_tokens=2180,
+        cache_read_input_tokens=2048,
+        cache_creation_input_tokens=100,
+    )
+    gchunk = _to_generic_chunk(_chunk([], usage=anthropic_shape))
+    assert gchunk["usage"]["cache_read_input_tokens"] == 2048
+    assert gchunk["usage"]["cache_creation_input_tokens"] == 100
+    assert "prompt_tokens_details" not in gchunk["usage"]
+
+
+def test_choices_bearing_chunk_carries_same_usage_details() -> None:
+    """A provider that attaches usage to a choices-bearing chunk (instead of a
+    separate include_usage frame) must emit the SAME detail fields as the
+    choice-less branch. LiteLLM's chunk builder takes prompt_tokens_details
+    unconditionally from the LAST usage-bearing chunk, so an asymmetric bare
+    dict here could null out detail delivered earlier."""
+    chunk = _chunk(
+        [
+            ChatChunkChoice(
+                index=0, delta=ChatChunkDelta(), finish_reason="stop"
+            )
+        ],
+        usage=GATEWAY_USAGE,
+    )
+    gchunk = _to_generic_chunk(chunk)
+    assert gchunk["usage"]["completion_tokens_details"] == {"reasoning_tokens": 12}
+    assert gchunk["usage"]["cache_read_input_tokens"] == 40
+    assert gchunk["is_finished"] is True

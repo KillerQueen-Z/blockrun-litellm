@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.9.1 — 2026-08-07
+
+### Added
+
+- **Token-detail passthrough on streamed usage.** The final `include_usage`
+  frame's `prompt_tokens_details` / `completion_tokens_details` (reasoning and
+  cached-token breakdowns) and the Anthropic `cache_read_input_tokens` /
+  `cache_creation_input_tokens` split now survive LiteLLM stream aggregation
+  instead of being flattened to three bare counts. Forwarding
+  `cache_read_input_tokens` also lets LiteLLM's estimate-path cost math apply
+  the cache-read discount (the gateway folds cache reads into `prompt_tokens`,
+  matching LiteLLM's own convention, so the subtraction is always safe).
+  Both `_to_generic_chunk` branches — the choice-less usage frame and a
+  choices-bearing chunk carrying usage inline — go through one shared
+  `_usage_dict` builder, so the two paths cannot disagree about which detail
+  fields survive.
+
+- **Spec-correct Responses API usage.** `/v1/responses` (non-stream and SSE)
+  now always emits `input_tokens_details.cached_tokens` and
+  `output_tokens_details.reasoning_tokens` — both REQUIRED by
+  `openai.types.responses.ResponseUsage`; typed openai-python clients crashed
+  on their absence. Values default to 0, only spec keys are projected (no
+  leaked `audio_tokens` / prediction-token fields), non-dict upstream garbage
+  coerces to 0, and Anthropic's top-level `cache_read_input_tokens` maps into
+  `cached_tokens` (those models carry no `prompt_tokens_details`). On the SSE
+  path a later bare usage frame merges instead of wiping detail captured
+  earlier.
+
+### Fixed
+
+- **Streamed calls no longer die on usage frames without detail blocks.**
+  `prompt_tokens_details` / `completion_tokens_details` are pydantic extras on
+  `ChatUsage` (`extra="allow"`), not declared fields — attribute access on an
+  absent extra raises `AttributeError`. Any streamed call whose usage frame
+  omitted them (Anthropic-shaped, or bare three-count) crashed at the final
+  frame; LiteLLM surfaced it as `APIConnectionError`, which retry-on-connection
+  clients treated as transient and retried an already-settled call — paying
+  twice for one completion. Details are now read from `model_extra`, where
+  extras actually live. Regression-locked for the bare, Anthropic, and
+  OpenAI-shaped frames end-to-end through `CustomStreamWrapper` +
+  `stream_chunk_builder`.
+
 ## 0.9.0 — 2026-07-24
 
 ### Added
