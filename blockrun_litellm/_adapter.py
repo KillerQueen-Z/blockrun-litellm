@@ -28,9 +28,10 @@ import concurrent.futures
 import logging
 import os
 import threading
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from blockrun_llm import AsyncLLMClient, ImageClient, LLMClient
+from ._auth import account_key, account_auth, cache_key, wallet_url
 from blockrun_llm.types import APIError, ChatCompletionChunk, PaymentError
 
 try:
@@ -149,76 +150,50 @@ def _wallet_env_var(api_url: Optional[str]) -> str:
     return "SOLANA_WALLET_KEY" if _is_solana_url(api_url) else "BLOCKRUN_WALLET_KEY"
 
 
-def _client_key(api_url: Optional[str], private_key: Optional[str]) -> str:
-    chain = "solana" if _is_solana_url(api_url) else "base"
-    fallback_env = os.environ.get(_wallet_env_var(api_url), "")
-    return f"{chain}::{api_url or ''}::{private_key or fallback_env}"
+def _client_key(api_url, private_key, api_key=None):
+    return cache_key(api_url, private_key, api_key)
 
 
-def get_sync_client(
-    api_url: Optional[str] = None,
-    private_key: Optional[str] = None,
-) -> Union[LLMClient, "SolanaLLMClient"]:  # type: ignore[name-defined]
-    """Return a cached sync client for the given creds/url.
-
-    Routes to :class:`SolanaLLMClient` when ``api_url`` points at
-    ``sol.blockrun.ai``, otherwise :class:`LLMClient` (Base).
-    """
-    key = _client_key(api_url, private_key)
+def get_sync_client(api_url=None, private_key=None, api_key=None):
+    key = _client_key(api_url, private_key, api_key)
     with _lock:
-        client = _sync_clients.get(key)
-        if client is None:
-            if _is_solana_url(api_url):
-                if not _HAS_SOLANA:
-                    raise ImportError(
-                        "Solana support requires the solana extra. "
-                        "Install with: pip install 'blockrun-llm[solana]'"
-                    )
-                # SolanaLLMClient also reads from SOLANA_WALLET_KEY if no
-                # explicit key was passed.
-                client = SolanaLLMClient(
-                    private_key=private_key,
-                    api_url=api_url or SOLANA_API_URL,
+        if key not in _sync_clients:
+            auth = account_auth(api_key, private_key, api_url)
+            if auth:
+                client = LLMClient(
+                    api_key=account_key(api_key, private_key),
+                    api_url=auth.api_url,
                     timeout=_CHAT_TIMEOUT,
                 )
             else:
-                client = LLMClient(private_key=private_key, api_url=api_url, timeout=_CHAT_TIMEOUT)
+                url = wallet_url(api_url, private_key)
+                cls = SolanaLLMClient if _is_solana_url(url) else LLMClient
+                if cls is None:
+                    raise ImportError("Install blockrun-litellm[solana] for Solana wallets")
+                client = cls(private_key=private_key, api_url=url, timeout=_CHAT_TIMEOUT)
             _sync_clients[key] = client
-        return client
+        return _sync_clients[key]
 
 
-def get_async_client(
-    api_url: Optional[str] = None,
-    private_key: Optional[str] = None,
-) -> Union[AsyncLLMClient, "AsyncSolanaLLMClient"]:  # type: ignore[name-defined]
-    """Return a cached async client for the given creds/url.
-
-    Routes to :class:`AsyncSolanaLLMClient` when ``api_url`` points at
-    ``sol.blockrun.ai``, otherwise :class:`AsyncLLMClient` (Base).
-    Requires ``blockrun-llm>=0.22.0`` for the async Solana client.
-    """
-    is_solana = _is_solana_url(api_url)
-    key = _client_key(api_url, private_key)
+def get_async_client(api_url=None, private_key=None, api_key=None):
+    key = _client_key(api_url, private_key, api_key)
     with _lock:
-        client = _async_clients.get(key)
-        if client is None:
-            if is_solana:
-                if not _HAS_SOLANA or AsyncSolanaLLMClient is None:
-                    raise ImportError(
-                        "Solana support requires the solana extra. "
-                        "Install with: pip install 'blockrun-litellm[solana]'"
-                    )
-                client = AsyncSolanaLLMClient(
-                    private_key=private_key,
-                    api_url=api_url or SOLANA_API_URL,
+        if key not in _async_clients:
+            auth = account_auth(api_key, private_key, api_url)
+            if auth:
+                client = AsyncLLMClient(
+                    api_key=account_key(api_key, private_key),
+                    api_url=auth.api_url,
                     timeout=_CHAT_TIMEOUT,
                 )
             else:
-                client = AsyncLLMClient(
-                    private_key=private_key, api_url=api_url, timeout=_CHAT_TIMEOUT
-                )
+                url = wallet_url(api_url, private_key)
+                cls = AsyncSolanaLLMClient if _is_solana_url(url) else AsyncLLMClient
+                if cls is None:
+                    raise ImportError("Install blockrun-litellm[solana] for Solana wallets")
+                client = cls(private_key=private_key, api_url=url, timeout=_CHAT_TIMEOUT)
             _async_clients[key] = client
-        return client
+        return _async_clients[key]
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +255,8 @@ def _strip_real_cost(payload: Dict[str, Any], client: Any) -> Dict[str, Any]:
     a ``{cost_usd, settlement}`` meta dict (cost may be ``None`` if unavailable)."""
     cost = payload.pop("cost_usd", None)
     settlement = payload.pop("settlement", None)
+    if getattr(client, "auth_mode", None) == "api-key":
+        return {"auth_mode": "api-key", "cost_usd": None, "settlement": None}
     if cost is None:
         cost = getattr(client, "_last_call_cost", None)
     return {"cost_usd": cost, "settlement": settlement}
@@ -296,6 +273,7 @@ def chat_completion_sync(
     *,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
     **openai_kwargs: Any,
 ) -> Dict[str, Any]:
     """
@@ -311,7 +289,11 @@ def chat_completion_sync(
     openai_kwargs.pop("stream", None)
     is_solana = _is_solana_url(api_url)
     kwargs = _filter_kwargs(openai_kwargs, is_solana=is_solana)
-    client = get_sync_client(api_url=api_url, private_key=private_key)
+    client = get_sync_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     response = client.chat_completion(model=model, messages=messages, **kwargs)
     payload = response.model_dump(exclude_none=True)
     payload[_BLOCKRUN_META_KEY] = _strip_real_cost(payload, client)
@@ -324,6 +306,7 @@ async def chat_completion_async(
     *,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
     **openai_kwargs: Any,
 ) -> Dict[str, Any]:
     """Async variant of :func:`chat_completion_sync`.
@@ -334,7 +317,11 @@ async def chat_completion_async(
     openai_kwargs.pop("stream", None)
     is_solana = _is_solana_url(api_url)
     kwargs = _filter_kwargs(openai_kwargs, is_solana=is_solana)
-    client = get_async_client(api_url=api_url, private_key=private_key)
+    client = get_async_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     response = await client.chat_completion(model=model, messages=messages, **kwargs)
     payload = response.model_dump(exclude_none=True)
     payload[_BLOCKRUN_META_KEY] = _strip_real_cost(payload, client)
@@ -352,6 +339,7 @@ def chat_completion_stream_sync(
     *,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
     **openai_kwargs: Any,
 ) -> Iterator[ChatCompletionChunk]:
     """
@@ -365,7 +353,11 @@ def chat_completion_stream_sync(
     openai_kwargs.pop("stream", None)
     is_solana = _is_solana_url(api_url)
     kwargs = _filter_kwargs(openai_kwargs, is_solana=is_solana)
-    client = get_sync_client(api_url=api_url, private_key=private_key)
+    client = get_sync_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     yield from client.chat_completion_stream(model=model, messages=messages, **kwargs)
 
 
@@ -375,6 +367,7 @@ async def chat_completion_stream_async(
     *,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
     **openai_kwargs: Any,
 ) -> AsyncIterator[ChatCompletionChunk]:
     """Async variant of :func:`chat_completion_stream_sync`.
@@ -385,7 +378,11 @@ async def chat_completion_stream_async(
     openai_kwargs.pop("stream", None)
     is_solana = _is_solana_url(api_url)
     kwargs = _filter_kwargs(openai_kwargs, is_solana=is_solana)
-    client = get_async_client(api_url=api_url, private_key=private_key)
+    client = get_async_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     async for chunk in client.chat_completion_stream(model=model, messages=messages, **kwargs):
         yield chunk
 
@@ -413,51 +410,29 @@ def _solana_image_timeout() -> float:
         return _DEFAULT_SOLANA_IMAGE_TIMEOUT_S
 
 
-def get_image_client(
-    api_url: Optional[str] = None,
-    private_key: Optional[str] = None,
-) -> Union[ImageClient, "SolanaLLMClient"]:  # type: ignore[name-defined]
-    """Return a cached image client for the given creds/url.
-
-    Routes to :class:`SolanaLLMClient` when ``api_url`` points at
-    ``sol.blockrun.ai``, otherwise :class:`ImageClient` (Base).
-
-    The Solana branch is required because ``ImageClient`` only signs EIP-712
-    over the EVM ``Account`` — sending those payments to the Solana gateway
-    fails at x402 settlement (``transaction_simulation_failed``).
-    ``SolanaLLMClient`` exposes ``.image()`` / ``.image_edit()`` that hit the
-    same ``/v1/images/*`` endpoints with SVM-scheme x402 payments.
-    """
-    key = _client_key(api_url, private_key)
+def get_image_client(api_url=None, private_key=None, api_key=None):
+    key = _client_key(api_url, private_key, api_key)
     with _lock:
-        client = _image_clients.get(key)
-        if client is None:
-            if _is_solana_url(api_url):
-                if not _HAS_SOLANA or SolanaLLMClient is None:
-                    raise ImportError(
-                        "Solana support requires the solana extra. "
-                        "Install with: pip install 'blockrun-litellm[solana]'"
-                    )
+        if key not in _image_clients:
+            auth = account_auth(api_key, private_key, api_url)
+            if auth:
+                client = ImageClient(
+                    api_key=account_key(api_key, private_key), api_url=auth.api_url
+                )
+            elif _is_solana_url(wallet_url(api_url, private_key)):
+                if SolanaLLMClient is None:
+                    raise ImportError("Install blockrun-litellm[solana]")
                 client = SolanaLLMClient(
                     private_key=private_key,
-                    api_url=api_url or SOLANA_API_URL,
-                    # Raise the per-image-request timeout ceiling. The SDK caps
-                    # each image POST at ``image_timeout`` (SolanaLLMClient
-                    # default 200s); slow models such as ``openai/gpt-image-2``
-                    # can exceed that on the synchronous Solana path, so the
-                    # sidecar would otherwise throw ``httpx.ReadTimeout`` mid-
-                    # generation. NOTE: the general ``timeout=`` kwarg is the
-                    # chat baseline and is overridden per-request for images
-                    # (``_request_image_with_payment`` passes ``image_timeout``),
-                    # so ``image_timeout=`` is the knob that actually governs
-                    # image calls. Tunable via BLOCKRUN_SOLANA_IMAGE_TIMEOUT
-                    # for ops without a redeploy.
+                    api_url=wallet_url(api_url, private_key),
                     image_timeout=_solana_image_timeout(),
                 )
             else:
-                client = ImageClient(private_key=private_key, api_url=api_url)
+                client = ImageClient(
+                    private_key=private_key, api_url=wallet_url(api_url, private_key)
+                )
             _image_clients[key] = client
-        return client
+        return _image_clients[key]
 
 
 def _is_solana_image_client(client: Any) -> bool:
@@ -546,11 +521,14 @@ def image_generation_sync(
     quality: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    client = get_image_client(api_url=api_url, private_key=private_key)
-    response = _invoke_image_generate(
-        client, prompt, model=model, size=size, n=n, quality=quality
+    client = get_image_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
     )
+    response = _invoke_image_generate(client, prompt, model=model, size=size, n=n, quality=quality)
     return response.model_dump(exclude_none=True)
 
 
@@ -563,8 +541,13 @@ async def image_generation_async(
     quality: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    client = get_image_client(api_url=api_url, private_key=private_key)
+    client = get_image_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
         _image_executor,
@@ -586,8 +569,13 @@ def image_edit_sync(
     quality: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    client = get_image_client(api_url=api_url, private_key=private_key)
+    client = get_image_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     response = _invoke_image_edit(
         client,
         prompt,
@@ -612,8 +600,13 @@ async def image_edit_async(
     quality: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    client = get_image_client(api_url=api_url, private_key=private_key)
+    client = get_image_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
         _image_executor,
@@ -665,21 +658,22 @@ _SPEECH_AWAIT_CEILING_S = 150.0  # SpeechClient DEFAULT_TIMEOUT 120s + margin
 _BASE_MEDIA_CLASSES = {"video": "VideoClient", "music": "MusicClient", "speech": "SpeechClient"}
 
 
-def _get_media_client(medium: str, api_url: Optional[str], private_key: Optional[str]) -> Any:
-    """Dedicated Base client for ``medium``, or the unified SolanaLLMClient
-    (which get_image_client already builds + caches) when the URL is Solana."""
-    if _is_solana_url(api_url):
-        return get_image_client(api_url=api_url, private_key=private_key)
+def _get_media_client(medium, api_url, private_key, api_key=None):
     import blockrun_llm
 
-    base_cls = getattr(blockrun_llm, _BASE_MEDIA_CLASSES[medium])
-    key = f"{base_cls.__name__}::{_client_key(api_url, private_key)}"
+    auth = account_auth(api_key, private_key, api_url)
+    if not auth and _is_solana_url(wallet_url(api_url, private_key)):
+        return get_image_client(api_url=api_url, private_key=private_key)
+    cls = getattr(blockrun_llm, _BASE_MEDIA_CLASSES[medium])
+    key = cls.__name__ + "::" + _client_key(api_url, private_key, api_key)
     with _lock:
-        client = _media_clients.get(key)
-        if client is None:
-            client = base_cls(private_key=private_key, api_url=api_url)
-            _media_clients[key] = client
-        return client
+        if key not in _media_clients:
+            _media_clients[key] = (
+                cls(api_key=account_key(api_key, private_key), api_url=auth.api_url)
+                if auth
+                else cls(private_key=private_key, api_url=wallet_url(api_url, private_key))
+            )
+        return _media_clients[key]
 
 
 def _is_solana_client(client: Any) -> bool:
@@ -700,20 +694,26 @@ def _solana_media_method(client: Any, method: str) -> Any:
     return fn
 
 
-def get_video_client(api_url: Optional[str] = None, private_key: Optional[str] = None) -> Any:
+def get_video_client(
+    api_url: Optional[str] = None, private_key: Optional[str] = None, api_key: Optional[str] = None
+) -> Any:
     """VideoClient (Base) or the unified SolanaLLMClient (Solana)."""
-    return _get_media_client("video", api_url, private_key)
+    return _get_media_client("video", api_url, private_key, api_key)
 
 
-def get_music_client(api_url: Optional[str] = None, private_key: Optional[str] = None) -> Any:
+def get_music_client(
+    api_url: Optional[str] = None, private_key: Optional[str] = None, api_key: Optional[str] = None
+) -> Any:
     """MusicClient (Base) or the unified SolanaLLMClient (Solana)."""
-    return _get_media_client("music", api_url, private_key)
+    return _get_media_client("music", api_url, private_key, api_key)
 
 
-def get_speech_client(api_url: Optional[str] = None, private_key: Optional[str] = None) -> Any:
+def get_speech_client(
+    api_url: Optional[str] = None, private_key: Optional[str] = None, api_key: Optional[str] = None
+) -> Any:
     """SpeechClient (Base) or the unified SolanaLLMClient (Solana). Serves both
     TTS (speech) and sound-effects."""
-    return _get_media_client("speech", api_url, private_key)
+    return _get_media_client("speech", api_url, private_key, api_key)
 
 
 async def _run_media(
@@ -764,6 +764,7 @@ async def video_generation_async(
     model: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
     **params: Any,
 ) -> Dict[str, Any]:
     """Generate a video. Extra kwargs (see :data:`VIDEO_PARAM_KEYS`) forward to
@@ -771,7 +772,11 @@ async def video_generation_async(
     arg). Client-supplied ``budget_seconds``/``timeout`` are clamped to the
     server cap so a request body can't pin a worker thread indefinitely; a
     malformed (non-numeric) value raises ValueError → HTTP 400 at the proxy."""
-    client = get_video_client(api_url=api_url, private_key=private_key)
+    client = get_video_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     model = _canonical_video_model(model)
     params = {k: v for k, v in params.items() if v is not None}
     for knob in ("budget_seconds", "timeout"):
@@ -802,10 +807,15 @@ async def music_generation_async(
     lyrics: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate a music track. Raises ValueError (→ HTTP 400 at the proxy) when
     ``lyrics`` is combined with ``instrumental=True`` — the SDK rejects that."""
-    client = get_music_client(api_url=api_url, private_key=private_key)
+    client = get_music_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     # Same call shape on both chains; only the method name differs.
     media_fn = (
         _solana_media_method(client, "music") if _is_solana_client(client) else client.generate
@@ -827,9 +837,14 @@ async def speech_generation_async(
     speed: Optional[float] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Synthesize speech (TTS)."""
-    client = get_speech_client(api_url=api_url, private_key=private_key)
+    client = get_speech_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     kw = {"model": model, "voice": voice, "response_format": response_format, "speed": speed}
     kw = {k: v for k, v in kw.items() if v is not None}
     media_fn = (
@@ -848,9 +863,14 @@ async def sound_effect_async(
     response_format: Optional[str] = None,
     api_url: Optional[str] = None,
     private_key: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate a cinematic sound effect."""
-    client = get_speech_client(api_url=api_url, private_key=private_key)
+    client = get_speech_client(
+        api_url=api_url,
+        private_key=private_key,
+        **({"api_key": api_key} if api_key is not None else {}),
+    )
     kw = {
         "model": model,
         "duration_seconds": duration_seconds,

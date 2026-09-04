@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/blockrun-litellm.svg)](https://pypi.org/project/blockrun-litellm/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-LiteLLM adapter for [BlockRun](https://blockrun.ai) — call x402-paid AI models through [LiteLLM](https://github.com/BerriAI/litellm) with zero changes to your existing code. **Base and Solana chains supported.**
+LiteLLM adapter for [BlockRun](https://blockrun.ai) — call AI models with account API keys or x402 wallet payments through [LiteLLM](https://github.com/BerriAI/litellm) with zero changes to your existing code. **Solana and Base wallets supported.**
 
 📚 **Full docs in [`docs/`](docs/)** — bilingual (English + 中文):
 - [`CUSTOMER-ONBOARDING`](docs/CUSTOMER-ONBOARDING.md) / [`中文`](docs/CUSTOMER-ONBOARDING.zh.md) — 5-minute walkthrough, both modes
@@ -14,7 +14,7 @@ LiteLLM adapter for [BlockRun](https://blockrun.ai) — call x402-paid AI models
 - [Chat Completions API](https://blockrun.ai/docs/api-reference/chat-completions)
 - [Models & pricing](https://blockrun.ai/docs/api-reference/models)
 
-> **TL;DR** — BlockRun's `/v1/chat/completions` is already OpenAI-compatible at the protocol level. The only thing that differs is *authentication*: BlockRun uses per-request x402 wallet signatures (non-custodial USDC micropayments on Base / Solana), not a Bearer API key. This package bridges that gap.
+> **Authentication:** use `BLOCKRUN_API_KEY` for prepaid account credits, or an x402 wallet for USDC payments on Solana or Base. Both work with the custom provider and sidecar.
 
 [中文文档见底部 / Chinese docs at the bottom](#中文文档)
 
@@ -27,7 +27,7 @@ LiteLLM adapter for [BlockRun](https://blockrun.ai) — call x402-paid AI models
 | **1. Custom provider** (in-process) | Apps using the LiteLLM **Python library** | `litellm.completion(model="blockrun/openai/gpt-5.5", ...)` |
 | **2. Local proxy** (sidecar) | Apps using the LiteLLM **Proxy Server** (or any OpenAI client) | `api_base="http://localhost:4001/v1"` |
 
-Both modes share the same underlying wallet/signing flow (via the [`blockrun-llm`](https://github.com/BlockRunAI/blockrun-llm) SDK), so they behave identically. Pick whichever fits your deployment.
+Both modes share account authentication or wallet signing (via the [`blockrun-llm`](https://github.com/BlockRunAI/blockrun-llm) SDK), so they behave identically. Pick whichever fits your deployment.
 
 ### Verified end-to-end against the live BlockRun gateway
 
@@ -53,16 +53,48 @@ $ curl -sS http://127.0.0.1:4001/v1/chat/completions \
 
 ---
 
+## Account API quick start
+
+[Register or sign in](https://user.blockrun.ai), [create an API key](https://user.blockrun.ai/dashboard/keys), and [add credits](https://user.blockrun.ai/dashboard/credits).
+
+This review branch requires the Python SDK implementation in [SDK PR #58](https://github.com/BlockRunAI/blockrun-llm/pull/58). Until that dependency is released, install the exact preview revision from this checkout:
+
+```bash
+pip install -r requirements-api-preview.txt
+pip install -e '.[proxy]'
+export BLOCKRUN_API_KEY=brk_live_YOUR_KEY
+blockrun-litellm-proxy --port 4001
+```
+
+Do not publish this integration before the SDK release is available and its minimum version is reflected in `pyproject.toml`. The existing PyPI installation instructions below describe released wallet support.
+
+```python
+import litellm
+from blockrun_litellm import register
+register()
+response = litellm.completion(
+    model="blockrun/openai/gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(response.choices[0].message.content)
+```
+
+`BLOCKRUN_API_KEY` selects account mode without loading or creating a wallet. Per-call `api_key="brk_live_..."` is also supported; an explicit wallet `private_key` selects wallet mode. Supplying both explicitly is rejected. `BLOCKRUN_API_BASE_URL` defaults to `https://api.blockrun.ai` (an optional `/v1` suffix is accepted); a leftover wallet `BLOCKRUN_API_URL` does not override account mode. Native OpenAI chat, Anthropic Messages and Responses are forwarded by the sidecar; media uses authenticated SDK requests and polling. Account errors 401/402/429 preserve their status and retry information without x402 payment retries.
+
+The account portal is authoritative for credit balance and charges. Account calls are marked `api-key` in audit logs and are not reported as wallet settlements or a zero-dollar charge. Any LiteLLM token-based cost is an estimate. `BLOCKRUN_PROXY_TOKEN` separately protects access to your local sidecar.
+
+Live account acceptance covers chat JSON/SSE, Messages and Responses JSON. Responses SSE and video completion still depend on [Enterprise PR #10](https://github.com/BlockRunAI/enterprise/pull/10) and its deployment/configuration. Native Gemini `/v1beta` account availability is not verified; call Google models through chat completions when using account keys. Media authentication/polling is tested with deterministic local responses; this is not a claim that every paid media model was exercised live.
+
 ## Install
 
 ```bash
-# Base chain only — minimal
+# Account API or Base wallet — minimal
 pip install blockrun-litellm
 
-# Base chain + local OpenAI-compatible proxy (FastAPI/uvicorn)
+# Account API or Base wallet + local proxy
 pip install 'blockrun-litellm[proxy]'
 
-# Base + Solana (adds the x402 SVM toolchain)
+# Solana wallet + proxy (adds the x402 SVM toolchain)
 pip install 'blockrun-litellm[proxy,solana]'
 ```
 
@@ -72,8 +104,8 @@ Requires Python ≥ 3.9.
 
 | Chain | Gateway URL | Wallet env var | Status |
 |---|---|---|---|
-| Base (USDC) | `https://blockrun.ai/api` *(default)* | `BLOCKRUN_WALLET_KEY` | sync + async, streaming |
-| Solana (USDC) | `https://sol.blockrun.ai/api` | `SOLANA_WALLET_KEY` | sync + async, streaming on both (since 0.3.1) |
+| Solana (USDC) | `https://sol.blockrun.ai/api` *(new wallet default)* | `SOLANA_WALLET_KEY` | sync + async, streaming |
+| Base (USDC) | `https://blockrun.ai/api` | `BLOCKRUN_WALLET_KEY` | sync + async, streaming |
 
 To route on Solana, pass `api_base="https://sol.blockrun.ai/api"` plus `api_key=<solana-key>` to `litellm.completion(...)` — the adapter detects the chain from the URL and uses the right SDK client.
 
@@ -678,7 +710,7 @@ Yes, as of v0.2.0. Pass `stream=True` and the adapter routes through `blockrun-l
 On your machine only — `BLOCKRUN_WALLET_KEY` env var, or `~/.blockrun/.session` if you used `setup_agent_wallet()`. The proxy and provider both read from those sources via `blockrun-llm`. Only EIP-712 signatures are transmitted.
 
 **Q: How do I switch between Base and Solana?**
-Today this adapter wires to BlockRun's Base gateway (USDC on Base). Solana support tracks the `blockrun-llm` `SolanaLLMClient` and will be added in a follow-up release.
+Set `BLOCKRUN_CHAIN=solana` (the new-wallet default) or `BLOCKRUN_CHAIN=base`, or set `BLOCKRUN_API_URL` explicitly. Existing Base-only wallets and saved chain selections are preserved. Account API mode does not require a chain.
 
 **Q: Can I run the proxy in Docker / k8s?**
 Yes — it's a vanilla FastAPI app. Pass the wallet key via secret (env var), bind to `0.0.0.0` only inside a private network, and set `BLOCKRUN_PROXY_TOKEN` for an additional auth layer.

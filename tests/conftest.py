@@ -60,6 +60,8 @@ def _no_wallet_required(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make sure tests run without `BLOCKRUN_WALLET_KEY` set."""
     monkeypatch.delenv("BLOCKRUN_WALLET_KEY", raising=False)
     monkeypatch.delenv("BASE_CHAIN_WALLET_KEY", raising=False)
+    monkeypatch.delenv("BLOCKRUN_API_KEY", raising=False)
+    monkeypatch.setenv("BLOCKRUN_API_URL", "https://blockrun.ai/api")
 
 
 @pytest.fixture

@@ -73,6 +73,7 @@ from blockrun_llm.types import APIError, PaymentError
 from blockrun_llm.tx_log import decode_settlement_header
 
 from blockrun_litellm import _adapter
+from ._auth import account_key, account_auth, wallet_url, cache_key
 from blockrun_litellm import logger as _logger
 
 # Optional — present when blockrun-llm[solana] is installed alongside solana-py.
@@ -326,17 +327,35 @@ class _SolanaX402Transport(httpx.BaseTransport):
         self._base.close()
 
 
+def _account_error_response(exc: APIError) -> JSONResponse:
+    headers = {}
+    retry = getattr(exc, "retry_after", None)
+    if retry:
+        headers["Retry-After"] = retry
+    detail = getattr(exc, "response", None) or {"message": str(exc)}
+    return JSONResponse(
+        status_code=exc.status_code or 502, content={"error": detail}, headers=headers
+    )
+
+
 def _resolve_api_url() -> str:
-    return (os.environ.get("BLOCKRUN_API_URL") or _adapter.BASE_API_URL).rstrip("/")
+    auth = account_auth()
+    return auth.api_url if auth else wallet_url()
 
 
 def _messages_client(api_url: str) -> httpx.Client:
     """Cached httpx client whose transport signs x402 for any path on the chain
     implied by ``api_url`` (Base via EIP-712, Solana via SVM)."""
-    existing = _messages_http_clients.get(api_url)
+    auth = account_auth(api_url=api_url)
+    cache_id = cache_key(api_url) if auth else api_url
+    existing = _messages_http_clients.get(cache_id)
     if existing is not None:
         return existing
 
+    if auth:
+        client = httpx.Client(auth=auth, timeout=_adapter._CHAT_TIMEOUT, follow_redirects=False)
+        _messages_http_clients[cache_id] = client
+        return client
     if _adapter._is_solana_url(api_url):
         from blockrun_llm.solana_wallet import load_solana_wallet
 
@@ -364,7 +383,7 @@ def _messages_client(api_url: str) -> httpx.Client:
     client = httpx.Client(
         transport=_SignedAmountTransport(transport), timeout=_adapter._CHAT_TIMEOUT
     )
-    _messages_http_clients[api_url] = client
+    _messages_http_clients[cache_id] = client
     return client
 
 
@@ -569,6 +588,7 @@ async def _forward_passthrough(
     qs = request.url.query if forward_query else ""
     target = f"{api_url}{path}" + (f"?{qs}" if qs else "")
 
+    auth_mode = "api-key" if account_key() is not None else "wallet"
     _t0 = time.monotonic()
     model = model_override or _body_model(raw)
     req_id = request.headers.get("x-request-id")
@@ -590,6 +610,19 @@ async def _forward_passthrough(
         async with _get_semaphore():
             try:
                 resp = await run_in_threadpool(_open_upstream_stream, client, target, raw, headers)
+            except APIError as exc:
+                _logger.log_proxy_call(
+                    auth_mode=auth_mode,
+                    model=model,
+                    path=path,
+                    stream=wants_stream,
+                    http_status=exc.status_code,
+                    cost_usd=None,
+                    settlement=None,
+                    latency_ms=_latency_ms(),
+                    request_id=req_id,
+                )
+                return _account_error_response(exc)
             except Exception as exc:  # noqa: BLE001
                 # A Solana JSON-RPC fault during x402 signing (e.g. getAccountInfo
                 # timeout) surfaces here, BEFORE any upstream status exists. Map it
@@ -611,6 +644,7 @@ async def _forward_passthrough(
             body = await run_in_threadpool(resp.read)
             await run_in_threadpool(resp.close)
             _logger.log_proxy_call(
+                auth_mode=auth_mode,
                 model=model,
                 path=path,
                 stream=True,
@@ -633,6 +667,7 @@ async def _forward_passthrough(
             )
 
         _logger.log_proxy_call(
+            auth_mode=auth_mode,
             model=model,
             path=path,
             stream=True,
@@ -676,12 +711,26 @@ async def _forward_passthrough(
     async with _get_semaphore():
         try:
             status, ctype, content, cost, settlement = await run_in_threadpool(_post)
+        except APIError as exc:
+            _logger.log_proxy_call(
+                auth_mode=auth_mode,
+                model=model,
+                path=path,
+                stream=False,
+                http_status=exc.status_code,
+                cost_usd=None,
+                settlement=None,
+                latency_ms=_latency_ms(),
+                request_id=req_id,
+            )
+            return _account_error_response(exc)
         except Exception as exc:  # noqa: BLE001
             if _is_solana_rpc_exc(exc):
                 log.warning("solana rpc error during payment signing: %s", _solana_rpc_msg(exc))
                 return JSONResponse(status_code=503, content={"error": _solana_rpc_msg(exc)})
             raise
     _logger.log_proxy_call(
+        auth_mode=auth_mode,
         model=model,
         path=path,
         stream=False,
@@ -939,8 +988,10 @@ async def _media_endpoint(
     the ValueError arm they'd answer 400 — blaming the caller for a call they
     paid for. It is upstream's fault: 502, flagged, and logged.
     """
+    auth_mode = "api-key" if account_key() is not None else "wallet"
     _t0 = time.monotonic()
     req_id = uuid.uuid4().hex
+    error_headers = {}
     result: Optional[Dict[str, Any]] = None
     parse_failed_after_settlement = False
     reached_gateway = True
@@ -979,6 +1030,8 @@ async def _media_endpoint(
         except APIError as exc:
             status = exc.status_code if 400 <= getattr(exc, "status_code", 0) < 600 else 502
             payload = {"error": str(exc)}
+            if getattr(exc, "retry_after", None) is not None:
+                error_headers["Retry-After"] = str(exc.retry_after)
         except Exception as exc:  # noqa: BLE001 - a missing row is worse than a broad catch
             # Transport errors (httpx.ReadTimeout on a 10-minute image call,
             # connection resets) escape the SDK unwrapped. If one lands after the
@@ -994,6 +1047,7 @@ async def _media_endpoint(
             }
     settlement = _media_settlement(result)
     _logger.log_proxy_call(
+        auth_mode=auth_mode,
         model=model,
         path=path,
         stream=False,
@@ -1011,6 +1065,7 @@ async def _media_endpoint(
         ),
     )
     headers = _cost_response_headers(None, settlement)
+    headers.update(error_headers)
     if warning:
         headers[_WARNING_HEADER] = warning
     return JSONResponse(status_code=status, content=payload, headers=headers)
@@ -1248,9 +1303,7 @@ async def image_edits(request: Request) -> Any:
         if not values:
             raise HTTPException(400, "`image` is required")
         if len(values) > _MAX_IMAGE_PARTS:
-            raise HTTPException(
-                400, f"at most {_MAX_IMAGE_PARTS} image parts (got {len(values)})"
-            )
+            raise HTTPException(400, f"at most {_MAX_IMAGE_PARTS} image parts (got {len(values)})")
         images = [await _image_form_value(value, "image") for value in values]
         image: Any = images[0] if len(images) == 1 else images
         mask_value = form.get("mask")
@@ -1402,7 +1455,7 @@ def _openai_video_kwargs(body: Dict[str, Any]) -> Dict[str, Any]:
         try:
             kwargs["duration_seconds"] = int(float(seconds))
         except (TypeError, ValueError):
-            raise HTTPException(400, "`seconds` must be numeric (e.g. \"8\")")
+            raise HTTPException(400, '`seconds` must be numeric (e.g. "8")')
     if body.get("size") is not None:
         kwargs.update(_map_openai_video_size(body["size"]))
     kwargs.update({k: body[k] for k in _adapter.VIDEO_PARAM_KEYS if body.get(k) is not None})
@@ -1448,6 +1501,7 @@ async def _run_video_job(job: Dict[str, Any], prompt: str, kwargs: Dict[str, Any
     """Drive the blocking SDK submit+poll for one video job and record the
     outcome on the job dict. Errors are folded into the OpenAI ``error`` shape
     so a poller sees status=failed instead of a hung queue."""
+    auth_mode = "api-key" if account_key() is not None else "wallet"
     _t0 = time.monotonic()
     status = 200
     result: Optional[Dict[str, Any]] = None
@@ -1497,6 +1551,7 @@ async def _run_video_job(job: Dict[str, Any], prompt: str, kwargs: Dict[str, Any
             job["error"] = {"code": "server_error", "message": str(exc)}
     settlement = _video_job_settlement(job)
     _logger.log_proxy_call(
+        auth_mode=auth_mode,
         model=job["model"],
         path="/v1/videos",
         stream=False,
@@ -1560,9 +1615,12 @@ async def openai_videos_create(request: Request) -> Any:
 def _get_video_job_or_404(video_id: str) -> Dict[str, Any]:
     job = _video_jobs.get(video_id)
     if job is None:
-        raise HTTPException(404, f"video job '{video_id}' not found (jobs expire after "
-                                 f"{int(_VIDEO_JOB_TTL_S)}s and live on the sidecar instance "
-                                 "that accepted the create)")
+        raise HTTPException(
+            404,
+            f"video job '{video_id}' not found (jobs expire after "
+            f"{int(_VIDEO_JOB_TTL_S)}s and live on the sidecar instance "
+            "that accepted the create)",
+        )
     return job
 
 
@@ -1780,9 +1838,7 @@ def _usage_to_responses(usage: Dict[str, Any]) -> Dict[str, Any]:
         "output_tokens": _int_or_zero(usage.get("completion_tokens")),
         "total_tokens": _int_or_zero(usage.get("total_tokens")),
         "input_tokens_details": {"cached_tokens": cached},
-        "output_tokens_details": {
-            "reasoning_tokens": _int_or_zero(ctd.get("reasoning_tokens"))
-        },
+        "output_tokens_details": {"reasoning_tokens": _int_or_zero(ctd.get("reasoning_tokens"))},
     }
 
 
@@ -1987,7 +2043,11 @@ async def _responses_sse_stream(
 
 @app.post("/v1/responses", dependencies=[Depends(_require_token)])
 async def responses(request: Request) -> Any:
-    """OpenAI Responses API bridge → BlockRun Chat Completions."""
+    """Native account Responses, or the legacy wallet Chat Completions bridge."""
+    if account_key() is not None:
+        return await _forward_passthrough(
+            request, "/v1/responses", _openai_fwd_headers(request), allow_stream=True
+        )
     try:
         body = await request.json()
     except Exception:
@@ -2052,13 +2112,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.api_url:
-        os.environ["BLOCKRUN_API_URL"] = args.api_url
+        os.environ["BLOCKRUN_API_BASE_URL" if account_key() is not None else "BLOCKRUN_API_URL"] = (
+            args.api_url
+        )
 
     # Fail fast if no wallet — better than waiting for first request.
     try:
         _adapter.get_sync_client()
     except ValueError as exc:
-        parser.exit(2, f"\nWallet not configured:\n  {exc}\n")
+        parser.exit(2, f"\nAuthentication not configured:\n  {exc}\n")
 
     import uvicorn
 

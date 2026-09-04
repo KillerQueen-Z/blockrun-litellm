@@ -86,11 +86,7 @@ _write_lock = threading.Lock()
 
 def _resolve_path(path: Optional[str | Path] = None) -> Path:
     """Pick the log destination — explicit arg > env var > default."""
-    resolved = Path(
-        path
-        or os.environ.get("BLOCKRUN_LITELLM_LOG")
-        or DEFAULT_LOG_PATH
-    )
+    resolved = Path(path or os.environ.get("BLOCKRUN_LITELLM_LOG") or DEFAULT_LOG_PATH)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     return resolved
 
@@ -226,23 +222,24 @@ def _build_entry(
         "stream": stream,
         "latency_ms": _latency_ms(start_time, end_time),
         "request_id": (
-            kwargs.get("litellm_call_id")
-            or (kwargs.get("metadata") or {}).get("litellm_call_id")
+            kwargs.get("litellm_call_id") or (kwargs.get("metadata") or {}).get("litellm_call_id")
         ),
     }
 
     if failure is not None:
-        entry.update({
-            "status": "failure",
-            "completion": None,
-            "usage": None,
-            "cost_usd": None,
-            "cost_source": None,
-            "estimated_cost_usd": None,
-            "settlement": None,
-            "error_type": type(failure).__name__,
-            "error_message": str(failure),
-        })
+        entry.update(
+            {
+                "status": "failure",
+                "completion": None,
+                "usage": None,
+                "cost_usd": None,
+                "cost_source": None,
+                "estimated_cost_usd": None,
+                "settlement": None,
+                "error_type": type(failure).__name__,
+                "error_message": str(failure),
+            }
+        )
         return entry
 
     usage = _extract_usage(response_obj)
@@ -254,23 +251,29 @@ def _build_entry(
         return None
     estimate = _extract_cost(response_obj, kwargs)
     real = _extract_real_cost(response_obj)
+    hidden = getattr(response_obj, "_hidden_params", {}) or {}
+    account_mode = hidden.get("blockrun_auth_mode") == "api-key"
+    if account_mode:
+        real = {"cost_usd": None, "settlement": None}
     if real["cost_usd"] is not None:
         cost_usd = real["cost_usd"]
         cost_source = "blockrun_x402"
     else:
         cost_usd = estimate
-        cost_source = "litellm_estimate"
-    entry.update({
-        "status": "success",
-        "completion": completion,
-        "usage": usage,
-        # Real wallet deduction when known (x402), else LiteLLM's estimate.
-        "cost_usd": cost_usd,
-        "cost_source": cost_source,
-        # Keep LiteLLM's token×list-price estimate alongside for comparison.
-        "estimated_cost_usd": estimate,
-        "settlement": real["settlement"],
-    })
+        cost_source = "account_estimate" if account_mode else "litellm_estimate"
+    entry.update(
+        {
+            "status": "success",
+            "completion": completion,
+            "usage": usage,
+            # Real wallet deduction when known (x402), else LiteLLM's estimate.
+            "cost_usd": cost_usd,
+            "cost_source": cost_source,
+            # Keep LiteLLM's token×list-price estimate alongside for comparison.
+            "estimated_cost_usd": estimate,
+            "settlement": real["settlement"],
+        }
+    )
     return entry
 
 
@@ -285,6 +288,7 @@ def log_proxy_call(
     latency_ms: Optional[float],
     request_id: Optional[str] = None,
     settlement_status: Optional[str] = None,
+    auth_mode: Optional[str] = None,
 ) -> None:
     """Append a JSONL audit row for a raw FastAPI sidecar passthrough call.
 
@@ -328,6 +332,11 @@ def log_proxy_call(
             "settlement": settlement,
             "request_id": request_id,
         }
+        if auth_mode == "api-key":
+            entry.update(
+                auth_mode="api-key", cost_usd=None, cost_source="account_portal", settlement=None
+            )
+            settlement_status = None
         # Omitted when there's nothing to flag, so existing rows keep their shape
         # and anything parsing this file sees the key only when it means something.
         if settlement_status is not None:
@@ -366,8 +375,10 @@ class JSONLLogger(CustomLogger):
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
         # LiteLLM passes the exception object as the second positional arg in
         # the failure hook (it's called ``response_obj`` for legacy reasons).
-        exc = response_obj if isinstance(response_obj, BaseException) else (
-            kwargs.get("exception") if isinstance(kwargs, dict) else None
+        exc = (
+            response_obj
+            if isinstance(response_obj, BaseException)
+            else (kwargs.get("exception") if isinstance(kwargs, dict) else None)
         )
         entry = _build_entry(
             kwargs, None, start_time, end_time, failure=exc or Exception("unknown")

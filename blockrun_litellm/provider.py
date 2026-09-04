@@ -45,6 +45,7 @@ from blockrun_llm.types import APIError as BlockRunAPIError
 from blockrun_llm.types import ChatCompletionChunk, ChatUsage
 
 from blockrun_litellm import _adapter
+from ._auth import provider_credentials, account_key
 
 
 # Provider name surfaced to LiteLLM exception classes so the router knows
@@ -81,10 +82,23 @@ def _translate_to_litellm(exc: Exception, model: str) -> Optional[Exception]:
         )
     if isinstance(exc, BlockRunAPIError):
         status = getattr(exc, "status_code", 0)
-        if status == 429:
-            return litellm.RateLimitError(
-                message=str(exc), model=model, llm_provider=_LITELLM_PROVIDER
-            )
+        if status in (401, 402, 429):
+            if status == 401:
+                error = litellm.AuthenticationError(
+                    message=str(exc), model=model, llm_provider=_LITELLM_PROVIDER
+                )
+            elif status == 429:
+                error = litellm.RateLimitError(
+                    message=str(exc), model=model, llm_provider=_LITELLM_PROVIDER
+                )
+            else:
+                error = litellm.APIError(
+                    status_code=402, message=str(exc), model=model, llm_provider=_LITELLM_PROVIDER
+                )
+            error.retry_after = getattr(exc, "retry_after", None)
+            if error.retry_after and getattr(error, "response", None) is not None:
+                error.response.headers["Retry-After"] = error.retry_after
+            return error
         if status == 500:
             return litellm.InternalServerError(
                 message=str(exc), model=model, llm_provider=_LITELLM_PROVIDER
@@ -103,7 +117,7 @@ def _translate_to_litellm(exc: Exception, model: str) -> Optional[Exception]:
 # LiteLLM passes the provider-stripped model name *and* an "optional_params"
 # dict containing the OpenAI-style params (temperature, max_tokens, ...).
 # It also forwards ``api_base`` / ``api_key`` from the call site, which we
-# repurpose: ``api_base`` → BlockRun ``api_url``, ``api_key`` → wallet key.
+# map to the gateway URL and account key (legacy wallet keys remain accepted).
 _OPTIONAL_KEYS = (
     "max_tokens",
     "temperature",
@@ -168,6 +182,10 @@ def _attach_real_cost(response: litellm.ModelResponse, meta: Optional[Dict[str, 
     even if a future LiteLLM version reclaims ``response_cost``.
     """
     if not meta:
+        return
+    if meta.get("auth_mode") == "api-key":
+        response._hidden_params["blockrun_auth_mode"] = "api-key"
+        response._hidden_params["blockrun_cost_source"] = "account_portal"
         return
     cost = meta.get("cost_usd")
     if cost is None:
@@ -474,7 +492,7 @@ class BlockRunLLM(CustomLLM):
                 model=model,
                 messages=messages,
                 api_url=api_base,
-                private_key=api_key,
+                **provider_credentials(api_key, kwargs),
                 **openai_kwargs,
             )
         except Exception as exc:
@@ -498,7 +516,7 @@ class BlockRunLLM(CustomLLM):
                 model=model,
                 messages=messages,
                 api_url=api_base,
-                private_key=api_key,
+                **provider_credentials(api_key, kwargs),
                 **openai_kwargs,
             )
         except Exception as exc:
@@ -535,15 +553,23 @@ class BlockRunLLM(CustomLLM):
                 model=model,
                 messages=messages,
                 api_url=api_base,
-                private_key=api_key,
+                **provider_credentials(api_key, kwargs),
                 **openai_kwargs,
             ):
                 # Per-call x402 charge the SDK attaches to each chunk (race-free,
                 # vs the shared client._last_call_cost). ``None`` on older SDKs
                 # that don't attach it -> estimate fallback, no injection.
-                cost = getattr(chunk, "cost_usd", None)
+                creds = provider_credentials(api_key, kwargs)
+                account_mode = (
+                    account_key(creds.get("api_key"), creds.get("private_key")) is not None
+                )
+                cost = None if account_mode else getattr(chunk, "cost_usd", None)
                 for gchunk in _iter_stream_chunks(chunk, stream_state):
-                    if cost is not None:
+                    if account_mode:
+                        gchunk.setdefault("_hidden_params", {}).update(
+                            blockrun_auth_mode="api-key", blockrun_cost_source="account_portal"
+                        )
+                    elif cost is not None:
                         _inject_real_cost(gchunk, cost)
                     yield gchunk
         except Exception as exc:
@@ -569,12 +595,20 @@ class BlockRunLLM(CustomLLM):
                 model=model,
                 messages=messages,
                 api_url=api_base,
-                private_key=api_key,
+                **provider_credentials(api_key, kwargs),
                 **openai_kwargs,
             ):
-                cost = getattr(chunk, "cost_usd", None)
+                creds = provider_credentials(api_key, kwargs)
+                account_mode = (
+                    account_key(creds.get("api_key"), creds.get("private_key")) is not None
+                )
+                cost = None if account_mode else getattr(chunk, "cost_usd", None)
                 for gchunk in _iter_stream_chunks(chunk, stream_state):
-                    if cost is not None:
+                    if account_mode:
+                        gchunk.setdefault("_hidden_params", {}).update(
+                            blockrun_auth_mode="api-key", blockrun_cost_source="account_portal"
+                        )
+                    elif cost is not None:
                         _inject_real_cost(gchunk, cost)
                     yield gchunk
         except Exception as exc:

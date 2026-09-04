@@ -1,0 +1,2 @@
+# Review-only SDK dependency. Replace with the canonical release before publishing.
+blockrun-llm @ git+https://github.com/KillerQueen-Z/blockrun-llm.git@28052aa4d5f7a54ab23f61375dfc222d22110300
